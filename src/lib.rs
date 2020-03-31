@@ -48,15 +48,13 @@ fn parse_bounds(bounds: &Punctuated<TypeParamBound, Token![+]>) -> Option<Conver
     if bounds.len() != 1 {
         return None;
     }
-    if let TypeParamBound::Trait(ref tb) = bounds.first().unwrap().into_value() {
+    if let TypeParamBound::Trait(ref tb) = bounds.first().unwrap() {
         if let Some(ref seg) = tb.path.segments.iter().last() {
             if let PathArguments::AngleBracketed(ref gen_args) = seg.arguments {
                 if gen_args.args.len() != 1 {
                     return None;
                 }
-                if let GenericArgument::Type(ref arg_ty) =
-                    gen_args.args.first().unwrap().into_value()
-                {
+                if let GenericArgument::Type(ref arg_ty) = gen_args.args.first().unwrap() {
                     if seg.ident == "Into" {
                         return Some(Conversion::Into(arg_ty));
                     } else if seg.ident == "AsRef" {
@@ -72,7 +70,7 @@ fn parse_bounds(bounds: &Punctuated<TypeParamBound, Token![+]>) -> Option<Conver
 }
 
 // create a map from generic type to Conversion
-fn parse_generics<'a>(decl: &'a FnDecl) -> (HashMap<Ident, Conversion<'a>>, Generics) {
+fn parse_generics<'a>(decl: &'a Signature) -> (HashMap<Ident, Conversion<'a>>, Generics) {
     let mut ty_conversions = HashMap::new();
     let mut params = Punctuated::new();
     for gp in decl.generics.params.iter() {
@@ -143,56 +141,52 @@ fn convert<'a>(
     };
     let mut has_self = false;
     let mut argexprs = Punctuated::new();
-    inputs.iter().for_each(|input| {
-        match input {
-            FnArg::SelfRef(..) | FnArg::SelfValue(..) => {
-                has_self = true;
-                argtypes.push(input.clone());
+    inputs.iter().for_each(|input| match input {
+        FnArg::Receiver(..) => {
+            has_self = true;
+            argtypes.push(input.clone());
+        }
+        FnArg::Typed(PatType {
+            ref attrs,
+            ref pat,
+            ref ty,
+            ref colon_token,
+        }) => match **ty {
+            Type::ImplTrait(TypeImplTrait { ref bounds, .. }) => {
+                if let Some(conv) = parse_bounds(bounds) {
+                    argtypes.push(FnArg::Typed(PatType {
+                        attrs: attrs.clone(),
+                        pat: pat.clone(),
+                        colon_token: colon_token.clone(),
+                        ty: Box::new(conv.target_type()),
+                    }));
+                    let ident = pat_to_ident(pat);
+                    conversions.add(ident.clone(), conv);
+                    argexprs.push(conv.conversion_expr(ident));
+                    return;
+                }
             }
-            FnArg::Inferred(ref pat) => {
-                argtypes.push(input.clone());
-                argexprs.push(pat_to_expr(pat));
-            }
-            FnArg::Ignored(..) => {} // don't add to the inner args
-            FnArg::Captured(ArgCaptured {
-                ref pat,
-                ref ty,
-                ref colon_token,
-            }) => match *ty {
-                Type::ImplTrait(TypeImplTrait { ref bounds, .. }) => {
-                    if let Some(conv) = parse_bounds(bounds) {
-                        argtypes.push(FnArg::Captured(ArgCaptured {
+            Type::Path(..) => {
+                if let Some(ident) = parse_bounded_type(ty) {
+                    if let Some(conv) = ty_conversions.get(&ident) {
+                        argtypes.push(FnArg::Typed(PatType {
+                            attrs: attrs.clone(),
                             pat: pat.clone(),
                             colon_token: colon_token.clone(),
-                            ty: conv.target_type(),
+                            ty: Box::new(conv.target_type()),
                         }));
                         let ident = pat_to_ident(pat);
-                        conversions.add(ident.clone(), conv);
-                        argexprs.push(conv.conversion_expr(ident));
+                        conversions.add(ident, conv.clone());
+                        argexprs.push(conv.conversion_expr(pat_to_ident(pat)));
                         return;
                     }
                 }
-                Type::Path(..) => {
-                    if let Some(ident) = parse_bounded_type(ty) {
-                        if let Some(conv) = ty_conversions.get(&ident) {
-                            argtypes.push(FnArg::Captured(ArgCaptured {
-                                pat: pat.clone(),
-                                colon_token: colon_token.clone(),
-                                ty: conv.target_type(),
-                            }));
-                            let ident = pat_to_ident(pat);
-                            conversions.add(ident, conv.clone());
-                            argexprs.push(conv.conversion_expr(pat_to_ident(pat)));
-                            return;
-                        }
-                    }
-                }
-                _ => {
-                    argtypes.push(input.clone());
-                    argexprs.push(pat_to_expr(pat));
-                }
-            },
-        }
+            }
+            _ => {
+                argtypes.push(input.clone());
+                argexprs.push(pat_to_expr(pat));
+            }
+        },
     });
     (argtypes, conversions, argexprs, has_self)
 }
@@ -252,10 +246,11 @@ pub fn momo(_attrs: TokenStream, code: TokenStream) -> TokenStream {
     let code_clone = code.clone();
     let fn_item = parse_macro_input!(code as Item);
     if let Item::Fn(ref item_fn) = fn_item {
-        let inner_ident = syn::parse_str::<Ident>(&format!("_{}_inner", item_fn.ident)).unwrap();
-        let (ty_conversions, generics) = parse_generics(&item_fn.decl);
+        let inner_ident =
+            syn::parse_str::<Ident>(&format!("_{}_inner", item_fn.sig.ident)).unwrap();
+        let (ty_conversions, generics) = parse_generics(&item_fn.sig);
         let (argtypes, mut conversions, argexprs, has_self) =
-            convert(&item_fn.decl.inputs, ty_conversions);
+            convert(&item_fn.sig.inputs, ty_conversions);
         let mut new_item = Item::Fn(ItemFn {
             block: if has_self {
                 parse_quote!({ self.#inner_ident(#argexprs) })
@@ -270,12 +265,12 @@ pub fn momo(_attrs: TokenStream, code: TokenStream) -> TokenStream {
         }
         let mut new_inner_item = ItemFn {
             vis: Visibility::Inherited,
-            ident: inner_ident,
-            decl: Box::new(FnDecl {
+            sig: Signature {
                 generics: generics,
                 inputs: argtypes,
-                ..(&*item_fn.decl).clone()
-            }),
+                ident: inner_ident,
+                ..item_fn.sig.clone()
+            },
             ..item_fn.clone()
         };
         new_inner_item.block = Box::new(conversions.fold_block(std::mem::replace(
